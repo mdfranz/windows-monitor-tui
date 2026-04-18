@@ -1,0 +1,23 @@
+version: "3"
+
+tasks:
+  build:
+    desc: Build the monitor binary
+    cmds:
+      - go build -o monitor.exe .
+
+  run:
+    desc: Run the monitor
+    cmds:
+      - go run .
+
+  clean:
+    desc: Remove built binaries
+    cmds:
+      - cmd: del monitor.exe
+        ignore_error: true
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test -v ./...

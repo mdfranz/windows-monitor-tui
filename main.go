@@ -21,10 +21,12 @@ import (
 type timeScale int
 
 const (
-	scale1Min  timeScale = 60
-	scale5Min  timeScale = 300
-	scale15Min timeScale = 900
+	scale1m    timeScale = 60
+	scale5m    timeScale = 300
+	scale15m   timeScale = 900
 )
+
+var scales = []timeScale{scale1m, scale5m, scale15m}
 
 type tickMsg time.Time
 type logMsg []string
@@ -68,7 +70,7 @@ type model struct {
 	height          int
 	graphHeight     int
 	ready           bool
-	scale           timeScale
+	scaleIdx        int
 }
 
 func initialModel() model {
@@ -82,7 +84,7 @@ func initialModel() model {
 		pingCloudBuf:    []float64{0.1, 0.1},
 		seenErrors:      make(map[string]bool),
 		logs:            []string{"[System] Monitoring started..."},
-		scale:           scale1Min,
+		scaleIdx:        0, // Default to 1m
 	}
 }
 
@@ -127,9 +129,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c": return m, tea.Quit
-		case "1": m.scale = scale1Min
-		case "2": m.scale = scale5Min
-		case "3": m.scale = scale15Min
+		case "1": m.scaleIdx = 0 // 1m
+		case "2": m.scaleIdx = 1 // 5m
+		case "3": m.scaleIdx = 2 // 15m
 		}
 
 	case tea.WindowSizeMsg:
@@ -211,20 +213,28 @@ func (m *model) trimBuffers(max int) {
 }
 
 func (m model) downsample(data []float64, targetWidth int) []float64 {
-	windowSeconds := int(m.scale)
+	windowSeconds := int(scales[m.scaleIdx])
 	startIdx := len(data) - windowSeconds
 	if startIdx < 0 { startIdx = 0 }
 	activeData := data[startIdx:]
-	if len(activeData) <= targetWidth { return activeData }
+	
+	if len(activeData) == 0 { return make([]float64, targetWidth) }
+
+	// Always return exactly targetWidth elements to ensure the graph stretches to fill the space
 	result := make([]float64, targetWidth)
-	bucketSize := float64(len(activeData)) / float64(targetWidth)
 	for i := 0; i < targetWidth; i++ {
-		start, end := int(float64(i)*bucketSize), int(float64(i+1)*bucketSize)
-		if end > len(activeData) { end = len(activeData) }
-		var sum float64
-		count := 0
-		for j := start; j < end; j++ { sum += activeData[j]; count++ }
-		if count > 0 { result[i] = sum / float64(count) }
+		// Map target index to source index with simple linear scaling
+		srcIdx := float64(i) * float64(len(activeData)-1) / float64(targetWidth-1)
+		if targetWidth == 1 { srcIdx = 0 }
+		
+		idx := int(srcIdx)
+		if idx >= len(activeData)-1 {
+			result[i] = activeData[len(activeData)-1]
+		} else {
+			// Linear interpolation for smoother stretching
+			frac := srcIdx - float64(idx)
+			result[i] = activeData[idx]*(1-frac) + activeData[idx+1]*frac
+		}
 	}
 	return result
 }
@@ -241,19 +251,25 @@ func renderTimeAxis(width int, scale timeScale) string {
 func (m model) View() string {
 	if !m.ready { return "Initializing..." }
 	header := titleStyle.Render("SYSTEM MONITOR")
-	metrics := metricStyle.Render(fmt.Sprintf(" RAM: %.1f%%  %s", m.memUsed, time.Now().Format("15:04:05")))
+	currentScale := scales[m.scaleIdx]
+	metrics := metricStyle.Render(fmt.Sprintf(" RAM: %.1f%%  Scale: %v  %s", m.memUsed, time.Duration(currentScale)*time.Second, time.Now().Format("15:04:05")))
 	topBar := lipgloss.JoinHorizontal(lipgloss.Center, header, " ", metrics)
 
 	w, gH := m.width-12, m.graphHeight
-	timeAxis := "      " + renderTimeAxis(w, m.scale)
+	timeAxis := "      " + renderTimeAxis(w, currentScale)
 
 	// CPU
+	cpuVal := 0.0
+	if len(m.cpuBuffer) > 0 { cpuVal = m.cpuBuffer[len(m.cpuBuffer)-1] }
 	cpuD := m.downsample(m.cpuBuffer, w)
-	cpuG := graphStyle.Render(asciigraph.Plot(cpuD, asciigraph.Height(gH), asciigraph.Width(w), asciigraph.Caption("CPU (%)")))
+	cpuG := graphStyle.Render(asciigraph.Plot(cpuD, asciigraph.Height(gH), asciigraph.Width(w), asciigraph.Caption(fmt.Sprintf("CPU: %.1f%%", cpuVal))))
 
 	// Disk
+	dRead, dWrite := 0.0, 0.0
+	if len(m.diskReadBuffer) > 0 { dRead = m.diskReadBuffer[len(m.diskReadBuffer)-1] }
+	if len(m.diskWriteBuffer) > 0 { dWrite = m.diskWriteBuffer[len(m.diskWriteBuffer)-1] }
 	dr, dw := m.downsample(m.diskReadBuffer, w), m.downsample(m.diskWriteBuffer, w)
-	diskCaption := fmt.Sprintf("Disk KB/s (%s, %s)", greenLabel.Render("Read"), redLabel.Render("Write"))
+	diskCaption := fmt.Sprintf("Disk: %s %.1f / %s %.1f KB/s", greenLabel.Render("Read"), dRead, redLabel.Render("Write"), dWrite)
 	diskG := graphStyle.Render(asciigraph.PlotMany([][]float64{dr, dw}, 
 		asciigraph.Height(gH), 
 		asciigraph.Width(w), 
@@ -262,8 +278,11 @@ func (m model) View() string {
 	))
 
 	// Net
+	nSent, nRecv := 0.0, 0.0
+	if len(m.netSentBuffer) > 0 { nSent = m.netSentBuffer[len(m.netSentBuffer)-1] }
+	if len(m.netRecvBuffer) > 0 { nRecv = m.netRecvBuffer[len(m.netRecvBuffer)-1] }
 	ns, nr := m.downsample(m.netSentBuffer, w), m.downsample(m.netRecvBuffer, w)
-	netCaption := fmt.Sprintf("Net KB/s (%s, %s)", greenLabel.Render("Up"), redLabel.Render("Down"))
+	netCaption := fmt.Sprintf("Net: %s %.1f / %s %.1f KB/s", greenLabel.Render("Up"), nSent, redLabel.Render("Down"), nRecv)
 	netG := graphStyle.Render(asciigraph.PlotMany([][]float64{ns, nr}, 
 		asciigraph.Height(gH), 
 		asciigraph.Width(w), 
@@ -272,8 +291,11 @@ func (m model) View() string {
 	))
 
 	// Latency
+	pGoogle, pCloud := 0.0, 0.0
+	if len(m.pingGoogleBuf) > 0 { pGoogle = m.pingGoogleBuf[len(m.pingGoogleBuf)-1] }
+	if len(m.pingCloudBuf) > 0 { pCloud = m.pingCloudBuf[len(m.pingCloudBuf)-1] }
 	pg, pc := m.downsample(m.pingGoogleBuf, w), m.downsample(m.pingCloudBuf, w)
-	pingCaption := fmt.Sprintf("Latency ms (%s, %s)", blueLabel.Render("Google 8.8.8.8"), cyanLabel.Render("Cloudflare 1.1.1.1"))
+	pingCaption := fmt.Sprintf("Latency: %s %.1f / %s %.1f ms", blueLabel.Render("Google"), pGoogle, cyanLabel.Render("Cloudflare"), pCloud)
 	pingG := graphStyle.Render(asciigraph.PlotMany([][]float64{pg, pc}, 
 		asciigraph.Height(gH), 
 		asciigraph.Width(w), 
