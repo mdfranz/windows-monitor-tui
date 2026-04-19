@@ -1,12 +1,24 @@
 version: "3"
-
 tasks:
   build:
-    desc: Build the monitor binary
+    desc: Build and sign the monitor binary
     cmds:
       - go build -o monitor.exe .
+      - task: sign
+
+  sign:
+    desc: Self-sign the monitor binary
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ./sign.ps1
+
+  trust:
+    desc: Trust the dev certificate (Requires Admin)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ./trust-cert.ps1
 
   run:
+...
+
     desc: Run the monitor
     cmds:
       - go run .

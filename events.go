@@ -1,59 +1,59 @@
 package main
 
 import (
+	"encoding/json"
+	"log/slog"
+	"os/exec"
 	"strings"
-
-	"github.com/google/winops/winlog"
-	"golang.org/x/sys/windows"
 )
 
-// FetchErrors returns new error strings found in the last hour
-func FetchErrors(seenMap map[string]bool) []string {
-	xpath := "*[System[(Level=1 or Level=2) and TimeCreated[timediff(@SystemTime) <= 3600000]]]"
-	queries := map[string]string{
-		"Application": xpath,
-		"System":      xpath,
-		"Setup":       xpath,
-	}
-
-	xmlQuery, err := winlog.BuildStructuredXMLQuery(queries)
-	if err != nil {
-		return nil
-	}
-
-	queryPtr := windows.StringToUTF16Ptr(string(xmlQuery))
-	config := &winlog.SubscribeConfig{
-		Query: queryPtr,
-		Flags: 0x1,
-	}
-
-	hSubscription, err := winlog.Subscribe(config)
-	if err != nil {
-		return nil
-	}
-	defer windows.Close(hSubscription)
-
-	publisherCache := make(map[string]windows.Handle)
-	defer func() {
-		for _, h := range publisherCache {
-			windows.Close(h)
-		}
-	}()
-
-	events, err := winlog.GetRenderedEvents(config, publisherCache, hSubscription, 50, 0)
-	if err != nil {
-		return nil
-	}
-
-	var newLogs []string
-	for _, event := range events {
-		if !seenMap[event] {
-			// Extract a summary or just use the XML. 
-			// For TUI, we'll trim it to keep it readable.
-			cleanEvent := strings.TrimSpace(event)
-			newLogs = append(newLogs, cleanEvent)
-			seenMap[event] = true
-		}
-	}
-	return newLogs
+type WinEvent struct {
+	TimeCreated  string `json:"TimeCreated"`
+	ProviderName string `json:"ProviderName"`
+	Message      string `json:"Message"`
+	Id           int    `json:"Id"`
+	Level        int    `json:"Level"`
 }
+
+// FetchErrors returns all error strings found in the last 60 minutes
+func FetchErrors() []WinEvent {
+	// Use PowerShell with ISO date formatting for Go compatibility
+	psCommand := `
+$since = (Get-Date).AddMinutes(-60)
+$logs = @('Application', 'System', 'Setup', 'Microsoft-Windows-CodeIntegrity/Operational', 'Microsoft-Windows-AppLocker/EXE and DLL')
+$events = foreach ($log in $logs) {
+    Get-WinEvent -LogName $log -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -ge $since -and ($_.Level -le 4) }
+}
+if (-not $events) { exit 0 }
+$events | Select-Object @{Name='TimeCreated';Expression={$_.TimeCreated.ToString('yyyy-MM-ddTHH:mm:ssZ')}}, ProviderName, Message, Id, Level | ConvertTo-Json
+`
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCommand)
+	out, err := cmd.Output()
+	if err != nil {
+		slog.Error("powershell_execution_failed", "error", err)
+		return nil
+	}
+
+	trimmedOut := strings.TrimSpace(string(out))
+	if len(trimmedOut) == 0 || trimmedOut == "null" {
+		return nil
+	}
+
+	var rawEvents []WinEvent
+	if trimmedOut[0] == '{' {
+		var e WinEvent
+		if err := json.Unmarshal([]byte(trimmedOut), &e); err == nil {
+			rawEvents = append(rawEvents, e)
+		} else {
+			slog.Error("json_unmarshal_single_failed", "error", err, "output", trimmedOut)
+		}
+	} else {
+		if err := json.Unmarshal([]byte(trimmedOut), &rawEvents); err != nil {
+			slog.Error("json_unmarshal_list_failed", "error", err, "output", trimmedOut)
+			return nil
+		}
+	}
+
+	return rawEvents
+}
+
